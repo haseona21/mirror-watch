@@ -42,13 +42,11 @@ FIELDS = [
 ]
 PRIMARY_KEY = "Company Name"
 
-# Section order in Notion output
 SECTIONS = ["Seed", "Series A++", "Uncategorized"]
 
 
 # ── AIRTABLE API ──────────────────────────────────────────────────────────────
 def fetch_airtable_records() -> list[dict]:
-    """Fetch all records from Airtable via REST API, handling pagination."""
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}"
     headers = {"Authorization": f"Bearer {AIRTABLE_TOKEN}"}
     params = {"fields[]": FIELDS, "pageSize": 100}
@@ -67,7 +65,7 @@ def fetch_airtable_records() -> list[dict]:
         for record in data.get("records", []):
             fields = record.get("fields", {})
             all_records.append({
-                "_id": record["id"],  # internal only, never shown in Notion
+                "_id": record["id"],
                 **{f: str(fields.get(f, "")).strip() for f in FIELDS}
             })
 
@@ -90,7 +88,6 @@ def get_drive_service():
 
 
 def download_baseline(drive) -> list[dict]:
-    """Download last week's snapshot JSON from Google Drive."""
     try:
         request = drive.files().get_media(fileId=GDRIVE_FILE_ID)
         buf = io.BytesIO()
@@ -106,7 +103,6 @@ def download_baseline(drive) -> list[dict]:
 
 
 def upload_baseline(drive, records: list[dict]):
-    """Overwrite the baseline JSON on Google Drive with this week's snapshot."""
     data = json.dumps(records, indent=2).encode("utf-8")
     media = MediaIoBaseUpload(
         io.BytesIO(data),
@@ -119,21 +115,19 @@ def upload_baseline(drive, records: list[dict]):
 
 # ── DIFF ──────────────────────────────────────────────────────────────────────
 def find_new_deals(current: list[dict], baseline: list[dict]) -> list[dict]:
-    """Return records in current whose Airtable record ID is not in the baseline."""
     seen_ids = {r["_id"] for r in baseline}
-    new_deals = [r for r in current if r["_id"] not in seen_ids]
+    seen_names = {r["Company Name"].lower().strip() for r in baseline if r.get("Company Name")}
+    new_deals = [
+        r for r in current
+        if r["_id"] not in seen_ids
+        and r.get("Company Name", "").lower().strip() not in seen_names
+    ]
     print(f"🆕 Found {len(new_deals)} new deal(s)")
     return new_deals
 
 
 # ── CLASSIFICATION ────────────────────────────────────────────────────────────
 def classify_deal(deal: dict) -> str:
-    """
-    Classify a deal by parsing Other Notes.
-    - Contains "seed" (case-insensitive) → Seed
-    - Non-empty but no "seed" → Series A++
-    - Empty → Uncategorized
-    """
     notes = deal.get("Other Notes", "").strip()
     if not notes:
         return "Uncategorized"
@@ -143,7 +137,6 @@ def classify_deal(deal: dict) -> str:
 
 
 def classify_deals(deals: list[dict]) -> dict[str, list[dict]]:
-    """Group deals into sections based on Other Notes content."""
     grouped: dict[str, list[dict]] = {s: [] for s in SECTIONS}
     for deal in deals:
         section = classify_deal(deal)
@@ -166,7 +159,6 @@ NOTION_HEADERS = {
 
 
 def create_weekly_subpage(week_label: str) -> str:
-    """Create a new subpage under Mirror and return its page ID."""
     payload = {
         "parent": {"page_id": NOTION_PARENT_PAGE},
         "properties": {
@@ -189,7 +181,7 @@ def create_weekly_subpage(week_label: str) -> str:
 
 
 def make_text_block(label: str, value: str) -> dict | None:
-    """Build a Notion paragraph block. Returns None if value is blank."""
+    """Build a plain Notion paragraph block. Returns None if value is blank."""
     if not value or not value.strip():
         return None
 
@@ -203,7 +195,7 @@ def make_text_block(label: str, value: str) -> dict | None:
                 {
                     "type": "text",
                     "text": {"content": f"{label}: "},
-                    "annotations": {"bold": True}
+                    "annotations": {}
                 },
                 {
                     "type": "text",
@@ -215,14 +207,14 @@ def make_text_block(label: str, value: str) -> dict | None:
 
 
 def deal_to_blocks(deal: dict) -> list[dict]:
-    """Convert a deal into Notion blocks. Skips blank fields. Never shows _id."""
+    """Convert a deal into plain Notion paragraph blocks."""
     blocks = []
 
-    # Company name as H3 (section headers use H2)
+    # Company name as plain text
     blocks.append({
         "object": "block",
-        "type": "heading_3",
-        "heading_3": {
+        "type": "paragraph",
+        "paragraph": {
             "rich_text": [{"type": "text", "text": {"content": deal.get("Company Name", "Unknown")}}]
         }
     })
@@ -235,6 +227,8 @@ def deal_to_blocks(deal: dict) -> list[dict]:
         block = make_text_block(field, value)
         if block:
             blocks.append(block)
+
+    # Empty line between deals
     blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": []}})
 
     return blocks
@@ -252,7 +246,6 @@ def section_header_block(title: str) -> dict:
 
 
 def append_blocks(page_id: str, blocks: list[dict]):
-    """Append blocks to a Notion page in batches of 100 (API limit)."""
     for i in range(0, len(blocks), 100):
         batch = blocks[i:i + 100]
         resp = requests.patch(
@@ -266,10 +259,8 @@ def append_blocks(page_id: str, blocks: list[dict]):
 
 
 def write_to_notion(page_id: str, grouped: dict[str, list[dict]], total: int):
-    """Write deals grouped by section. Empty sections are omitted entirely."""
     all_blocks = []
 
-    # Intro summary
     all_blocks.append({
         "object": "block",
         "type": "paragraph",
@@ -285,7 +276,7 @@ def write_to_notion(page_id: str, grouped: dict[str, list[dict]], total: int):
     for section in SECTIONS:
         deals = grouped.get(section, [])
         if not deals:
-            continue  # omit empty sections entirely
+            continue
 
         all_blocks.append(section_header_block(section))
         for deal in deals:
@@ -303,29 +294,18 @@ def main():
 
     drive = get_drive_service()
 
-    # 1. Fetch current state from Airtable
     current_records = fetch_airtable_records()
-
-    # 2. Load last week's baseline from Drive
     baseline_records = download_baseline(drive)
-
-    # 3. Diff — find truly new records
     new_deals = find_new_deals(current_records, baseline_records)
 
     if not new_deals:
         print("ℹ️  No new deals this week. Skipping Notion write.")
     else:
-        # 4. Classify deals by parsing Other Notes
         print("🗂️  Classifying deals...")
         grouped = classify_deals(new_deals)
-
-        # 5. Create Notion subpage
         page_id = create_weekly_subpage(week_label)
-
-        # 6. Write grouped deals to Notion
         write_to_notion(page_id, grouped, len(new_deals))
 
-    # 7. Always update baseline with full current snapshot
     upload_baseline(drive, current_records)
 
     print("\n✅ Sync complete.\n")
