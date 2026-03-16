@@ -1,0 +1,37 @@
+name: Weekly Deals Sync
+
+on:
+  schedule:
+    # Every Monday at 6:00 AM CT (CST = UTC-5, so 11:00 UTC)
+    # Note: during CDT (summer) this will run at 7:00 AM CT instead of 6:00 AM
+    - cron: "0 11 * * 1"
+
+  # Allow manual trigger from GitHub Actions UI (useful for testing)
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync script
+        env:
+          AIRTABLE_TOKEN:        ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE_ID:      ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_ID:     ${{ secrets.AIRTABLE_TABLE_ID }}
+          NOTION_API_KEY:        ${{ secrets.NOTION_API_KEY }}
+          NOTION_PARENT_PAGE_ID: ${{ secrets.NOTION_PARENT_PAGE_ID }}
+          GDRIVE_FILE_ID:        ${{ secrets.GDRIVE_FILE_ID }}
+          GDRIVE_CREDS_JSON:     ${{ secrets.GDRIVE_CREDS_JSON }}
+        run: python src/sync_deals.py
