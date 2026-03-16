@@ -236,8 +236,6 @@ def deal_to_blocks(deal: dict) -> list[dict]:
         if block:
             blocks.append(block)
 
-    blocks.append({"object": "block", "type": "divider", "divider": {}})
-
     return blocks
 
 
