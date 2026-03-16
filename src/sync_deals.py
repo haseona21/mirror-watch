@@ -1,12 +1,13 @@
 """
 weekly_deals_sync.py
 --------------------
-1. Fetches all records from Airtable via REST API (no CSV needed)
+1. Fetches all records from Airtable via REST API
 2. Loads last week's snapshot from Google Drive
 3. Diffs to find new records (by Airtable record ID — never changes)
-4. Creates a new Notion subpage under the Mirror parent page
-5. Writes all new deals to that subpage in structured format
-6. Saves this week's full snapshot to Google Drive as the new baseline
+4. Classifies each deal by parsing Other Notes (Seed vs Series A++)
+5. Creates a new Notion subpage under the Mirror parent page
+6. Writes deals grouped by section, skipping blank fields, hiding internal IDs
+7. Saves this week's full snapshot to Google Drive as the new baseline
 """
 
 import os
@@ -20,15 +21,14 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 # ── ENV VARS (set in GitHub Secrets) ────────────────────────────────────────
 AIRTABLE_TOKEN     = os.environ["AIRTABLE_TOKEN"]
-AIRTABLE_BASE_ID   = os.environ["AIRTABLE_BASE_ID"]       # appoQFPWiFTtGuXPt
-AIRTABLE_TABLE_ID  = os.environ["AIRTABLE_TABLE_ID"]       # tblnlIiRgC7duo2E4
+AIRTABLE_BASE_ID   = os.environ["AIRTABLE_BASE_ID"]
+AIRTABLE_TABLE_ID  = os.environ["AIRTABLE_TABLE_ID"]
 NOTION_API_KEY     = os.environ["NOTION_API_KEY"]
-NOTION_PARENT_PAGE = os.environ["NOTION_PARENT_PAGE_ID"]   # "Mirror" page ID
-GDRIVE_FILE_ID     = os.environ["GDRIVE_FILE_ID"]          # ID of baseline JSON on Drive
-GDRIVE_CREDS_JSON  = os.environ["GDRIVE_CREDS_JSON"]       # Service account JSON (stringified)
+NOTION_PARENT_PAGE = os.environ["NOTION_PARENT_PAGE_ID"]
+GDRIVE_FILE_ID     = os.environ["GDRIVE_FILE_ID"]
+GDRIVE_CREDS_JSON  = os.environ["GDRIVE_CREDS_JSON"]
 
 # ── FIELD CONFIG ─────────────────────────────────────────────────────────────
-# Exact field names as they appear in Airtable
 FIELDS = [
     "Company Name",
     "Summary",
@@ -41,6 +41,9 @@ FIELDS = [
     "Other Notes",
 ]
 PRIMARY_KEY = "Company Name"
+
+# Section order in Notion output
+SECTIONS = ["Seed", "Series A++", "Uncategorized"]
 
 
 # ── AIRTABLE API ──────────────────────────────────────────────────────────────
@@ -64,7 +67,7 @@ def fetch_airtable_records() -> list[dict]:
         for record in data.get("records", []):
             fields = record.get("fields", {})
             all_records.append({
-                "_id": record["id"],  # Airtable record ID — never changes
+                "_id": record["id"],  # internal only, never shown in Notion
                 **{f: str(fields.get(f, "")).strip() for f in FIELDS}
             })
 
@@ -116,15 +119,41 @@ def upload_baseline(drive, records: list[dict]):
 
 # ── DIFF ──────────────────────────────────────────────────────────────────────
 def find_new_deals(current: list[dict], baseline: list[dict]) -> list[dict]:
-    """
-    Return records in current whose Airtable record ID
-    does not exist in the baseline. Using record ID (not company name)
-    means renames don't cause false positives.
-    """
+    """Return records in current whose Airtable record ID is not in the baseline."""
     seen_ids = {r["_id"] for r in baseline}
     new_deals = [r for r in current if r["_id"] not in seen_ids]
     print(f"🆕 Found {len(new_deals)} new deal(s)")
     return new_deals
+
+
+# ── CLASSIFICATION ────────────────────────────────────────────────────────────
+def classify_deal(deal: dict) -> str:
+    """
+    Classify a deal by parsing Other Notes.
+    - Contains "seed" (case-insensitive) → Seed
+    - Non-empty but no "seed" → Series A++
+    - Empty → Uncategorized
+    """
+    notes = deal.get("Other Notes", "").strip()
+    if not notes:
+        return "Uncategorized"
+    if "seed" in notes.lower():
+        return "Seed"
+    return "Series A++"
+
+
+def classify_deals(deals: list[dict]) -> dict[str, list[dict]]:
+    """Group deals into sections based on Other Notes content."""
+    grouped: dict[str, list[dict]] = {s: [] for s in SECTIONS}
+    for deal in deals:
+        section = classify_deal(deal)
+        grouped[section].append(deal)
+
+    for section, items in grouped.items():
+        if items:
+            print(f"  {section}: {len(items)} deal(s)")
+
+    return grouped
 
 
 # ── NOTION ────────────────────────────────────────────────────────────────────
@@ -160,45 +189,45 @@ def create_weekly_subpage(week_label: str) -> str:
 
 
 def make_text_block(label: str, value: str) -> dict | None:
-    """Build a Notion paragraph block for a field."""
-    if not value:
+    """Build a Notion paragraph block. Returns None if value is blank."""
+    if not value or not value.strip():
         return None
 
     is_url = value.startswith("http://") or value.startswith("https://")
 
-    rich_text = [
-        {
-            "type": "text",
-            "text": {"content": f"{label}: "},
-            "annotations": {"bold": True}
-        },
-        {
-            "type": "text",
-            "text": {"content": value, **({"link": {"url": value}} if is_url else {})}
-        }
-    ]
-
     return {
         "object": "block",
         "type": "paragraph",
-        "paragraph": {"rich_text": rich_text}
+        "paragraph": {
+            "rich_text": [
+                {
+                    "type": "text",
+                    "text": {"content": f"{label}: "},
+                    "annotations": {"bold": True}
+                },
+                {
+                    "type": "text",
+                    "text": {"content": value, **({"link": {"url": value}} if is_url else {})}
+                }
+            ]
+        }
     }
 
 
 def deal_to_blocks(deal: dict) -> list[dict]:
-    """Convert a deal into Notion blocks: H2 heading + fields + divider."""
+    """Convert a deal into Notion blocks. Skips blank fields. Never shows _id."""
     blocks = []
 
-    # Company name as H2
+    # Company name as H3 (section headers use H2)
     blocks.append({
         "object": "block",
-        "type": "heading_2",
-        "heading_2": {
+        "type": "heading_3",
+        "heading_3": {
             "rich_text": [{"type": "text", "text": {"content": deal.get("Company Name", "Unknown")}}]
         }
     })
 
-    # All other fields
+    # All fields except Company Name — skip if blank, never show _id
     for field in FIELDS:
         if field == PRIMARY_KEY:
             continue
@@ -207,10 +236,20 @@ def deal_to_blocks(deal: dict) -> list[dict]:
         if block:
             blocks.append(block)
 
-    # Divider between deals
     blocks.append({"object": "block", "type": "divider", "divider": {}})
 
     return blocks
+
+
+def section_header_block(title: str) -> dict:
+    """Create an H2 block for a section header."""
+    return {
+        "object": "block",
+        "type": "heading_2",
+        "heading_2": {
+            "rich_text": [{"type": "text", "text": {"content": title}}]
+        }
+    }
 
 
 def append_blocks(page_id: str, blocks: list[dict]):
@@ -227,22 +266,31 @@ def append_blocks(page_id: str, blocks: list[dict]):
     print(f"✅ Written {len(blocks)} blocks to Notion")
 
 
-def write_to_notion(page_id: str, deals: list[dict]):
-    """Write summary line + all deals to the Notion subpage."""
-    all_blocks = [{
+def write_to_notion(page_id: str, grouped: dict[str, list[dict]], total: int):
+    """Write deals grouped by section. Empty sections are omitted entirely."""
+    all_blocks = []
+
+    # Intro summary
+    all_blocks.append({
         "object": "block",
         "type": "paragraph",
         "paragraph": {
             "rich_text": [{
                 "type": "text",
-                "text": {"content": f"{len(deals)} new deal(s) added this week."},
+                "text": {"content": f"{total} new deal(s) added this week."},
                 "annotations": {"italic": True}
             }]
         }
-    }]
+    })
 
-    for deal in deals:
-        all_blocks.extend(deal_to_blocks(deal))
+    for section in SECTIONS:
+        deals = grouped.get(section, [])
+        if not deals:
+            continue  # omit empty sections entirely
+
+        all_blocks.append(section_header_block(section))
+        for deal in deals:
+            all_blocks.extend(deal_to_blocks(deal))
 
     append_blocks(page_id, all_blocks)
 
@@ -250,7 +298,7 @@ def write_to_notion(page_id: str, deals: list[dict]):
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     today = datetime.now(timezone.utc)
-    week_label = today.strftime("%b %d, %Y")  # e.g. "Mar 17, 2026"
+    week_label = today.strftime("%b %d, %Y")
 
     print(f"\n🚀 Weekly deal sync — {week_label}\n")
 
@@ -268,13 +316,17 @@ def main():
     if not new_deals:
         print("ℹ️  No new deals this week. Skipping Notion write.")
     else:
-        # 4. Create Notion subpage
+        # 4. Classify deals by parsing Other Notes
+        print("🗂️  Classifying deals...")
+        grouped = classify_deals(new_deals)
+
+        # 5. Create Notion subpage
         page_id = create_weekly_subpage(week_label)
 
-        # 5. Write deals to Notion
-        write_to_notion(page_id, new_deals)
+        # 6. Write grouped deals to Notion
+        write_to_notion(page_id, grouped, len(new_deals))
 
-    # 6. Always update baseline with full current snapshot
+    # 7. Always update baseline with full current snapshot
     upload_baseline(drive, current_records)
 
     print("\n✅ Sync complete.\n")
