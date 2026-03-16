@@ -235,6 +235,7 @@ def deal_to_blocks(deal: dict) -> list[dict]:
         block = make_text_block(field, value)
         if block:
             blocks.append(block)
+    blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": []}})
 
     return blocks
 
